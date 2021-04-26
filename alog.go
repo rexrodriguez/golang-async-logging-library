@@ -29,10 +29,12 @@ func New(w io.Writer) *Alog {
 		w = os.Stdout
 	}
 	return &Alog{
-		dest:    w,
-		msgCh:   make(chan string),
-		errorCh: make(chan error),
-		m:       &sync.Mutex{},
+		dest:               w,
+		msgCh:              make(chan string),
+		errorCh:            make(chan error),
+		m:                  &sync.Mutex{},
+		shutdownCh:         make(chan struct{}),
+		shutdownCompleteCh: make(chan struct{}),
 	}
 }
 
@@ -40,14 +42,19 @@ func New(w io.Writer) *Alog {
 // the caller from being blocked.
 func (al Alog) Start() {
 	wg := &sync.WaitGroup{}
-	for msg := range al.msgCh {
-		wg.Add(1)
-		go func(msg string, g *sync.WaitGroup) {
-			al.write(msg, wg)
-		}(msg, wg)
-		wg.Done()
+
+loop:
+	for {
+		select {
+		case <-al.shutdownCh:
+			wg.Wait()
+			al.shutdown()
+			break loop
+		case msg := <-al.msgCh:
+			wg.Add(1)
+			go al.write(msg, wg)
+		}
 	}
-	wg.Wait()
 }
 
 func (al Alog) formatMessage(msg string) string {
@@ -58,21 +65,20 @@ func (al Alog) formatMessage(msg string) string {
 }
 
 func (al Alog) write(msg string, wg *sync.WaitGroup) {
-	wg.Add(1)
-	defer al.m.Unlock()
+	defer wg.Done()
 	al.m.Lock()
-	if _, err := al.Write(msg); err != nil {
-		wg.Add(1)
-		go func(err error, wg *sync.WaitGroup) {
+	defer al.m.Unlock()
+	_, err := al.dest.Write([]byte(al.formatMessage(msg)))
+	if err != nil {
+		go func(err error) {
 			al.errorCh <- err
-
-		}(err, wg)
-		wg.Done()
+		}(err)
 	}
-	wg.Done()
 }
 
 func (al Alog) shutdown() {
+	close(al.msgCh)
+	al.shutdownCompleteCh <- struct{}{}
 }
 
 // MessageChannel returns a channel that accepts messages that should be written to the log.
@@ -90,6 +96,8 @@ func (al Alog) ErrorChannel() <-chan error {
 // Stop shuts down the logger. It will wait for all pending messages to be written and then return.
 // The logger will no longer function after this method has been called.
 func (al Alog) Stop() {
+	al.shutdownCh <- struct{}{}
+	<-al.shutdownCompleteCh
 }
 
 // Write synchronously sends the message to the log output
